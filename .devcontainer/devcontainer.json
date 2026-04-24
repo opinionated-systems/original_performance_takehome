@@ -1,0 +1,15 @@
+{
+  "name": "original-performance-takehome",
+  "image": "mcr.microsoft.com/devcontainers/python:2-3.14-bookworm",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python"
+      }
+    }
+  },
+  "postCreateCommand": "python --version"
+}

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s \"https://mcr.microsoft.com/v2/devcontainers/python/tags/list\")",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); tags=[t for t in d.get\\('tags',[]\\) if '3.14' in t or '3.13' in t]; print\\('\\\\n'.join\\(sorted\\(tags\\)\\)\\)\")",
+      "Bash(docker pull *)"
+    ]
+  }
+}

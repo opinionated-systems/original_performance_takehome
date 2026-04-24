@@ -1,4 +1,4 @@
-# moonshotai/Kimi-K2.6
+# MiniMax M2.7
 
 from collections import defaultdict
 import random
@@ -213,14 +213,12 @@ class KernelBuilder:
     ):
         tmp1 = self.alloc_scratch('tmp1')
 
-        # OPTIMIZATION: Only allocate the pointer variables we actually use
-        # Memory layout: [0]=rounds, [1]=n_nodes, [2]=batch_size, [3]=forest_height,
-        #                [4]=forest_values_p, [5]=inp_indices_p, [6]=inp_values_p
-        # We skip allocating unused variables: rounds, n_nodes, batch_size, forest_height
+        # Only allocate the pointer variables we actually use
         used_vars = ['forest_values_p', 'inp_indices_p', 'inp_values_p']
         for v in used_vars:
             self.alloc_scratch(v, 1)
 
+        # Constants needed for nodes 0-30 and hash
         needed_consts = [0, 1, 2, 3, 4, 5, 6, 8, 9, 16, 19, 24] + list(range(7, 31))
         needed_consts = list(set(needed_consts))
         consts = {}
@@ -229,6 +227,7 @@ class KernelBuilder:
             consts[i] = addr
             self.const_map[i] = addr
 
+        # Hash constants - use fused multiply_add pattern
         hc_vals = [0x7ED55D16, 0xC761C23C, 0xFD7046C5, 0xB55A4F09, 4097, 33, 0xE9F8CC1D, 0xACCF6200, 16896]
         hash_consts = {}
         for val in hc_vals:
@@ -263,16 +262,15 @@ class KernelBuilder:
             if val not in (4097, 33):
                 vec_hash[val] = self.alloc_scratch(f'vh_{val & 0xFFFF}', VLEN)
 
+        # 31 pre-loaded nodes (0-30) for rounds 0-4
         PRELOADED_NODES = 31
         vec_nodes = {}
         for i in range(PRELOADED_NODES):
             vec_nodes[i] = self.alloc_scratch(f'vn_{i}', VLEN)
 
-        # PEER OPTIMIZATION: Precompute diff_2_1 = vec_nodes[2] - vec_nodes[1]
-        diff_2_1 = self.alloc_scratch('diff_2_1', VLEN)
-        
         ALU_CHUNKS = min(num_chunks, alu_chunks)
 
+        # Tuned chunk distributions
         C_FLOW3 = min(num_chunks, c_flow3)
         C_LOAD3 = min(num_chunks - C_FLOW3, 27)
         C_LOAD3_END = C_FLOW3 + C_LOAD3
@@ -284,9 +282,9 @@ class KernelBuilder:
         # ---- INITIALIZATION ----
         init_slots = []
 
-        # OPTIMIZATION: Only load the pointer values we need (positions 4, 5, 6)
+        # Load only the pointer values we need (positions 4, 5, 6)
         for i, v in enumerate(used_vars):
-            mem_pos = 4 + i
+            mem_pos = 4 + i  # forest_values_p at [4], inp_indices_p at [5], inp_values_p at [6]
             init_slots.append(('load', ('const', tmp1, mem_pos)))
             init_slots.append(('load', ('load', self.scratch[v], tmp1)))
 
@@ -309,19 +307,18 @@ class KernelBuilder:
 
         self.add_vliw(init_slots)
 
-        # EXP 6: Interleave vloads and broadcasts for better scheduling overlap
-        all_load_broadcast_slots = []
+        # Load nodes in chunks of 8 and broadcast
         for i in range(4):
             addr_reg = chunk_regs[i % min(num_chunks, 4)]['tmp']
-            all_load_broadcast_slots.append(('load', ('vload', tmp_vecs[0], addr_reg)))
+            self.add_vliw([('load', ('vload', tmp_vecs[0], addr_reg))])
+
+            broadcast_slots = []
             for j in range(8):
                 node_idx = i * 8 + j
                 if node_idx < PRELOADED_NODES:
-                    all_load_broadcast_slots.append(('valu', ('vbroadcast', vec_nodes[node_idx], tmp_vecs[0] + j)))
-        self.add_vliw(all_load_broadcast_slots)
+                    broadcast_slots.append(('valu', ('vbroadcast', vec_nodes[node_idx], tmp_vecs[0] + j)))
+            self.add_vliw(broadcast_slots)
 
-        # PEER OPTIMIZATION: Precompute diff_2_1 after loading vec_nodes
-        self.add_vliw([('valu', ('-', diff_2_1, vec_nodes[2], vec_nodes[1]))])
         self.add('flow', ('pause',))
 
         scalar_reg = self.alloc_scratch('scalar_reg')
@@ -330,6 +327,7 @@ class KernelBuilder:
         body = []
         fvp = self.scratch['forest_values_p']
 
+        # Fused load with pointer increment
         ptr_idx = self.alloc_scratch('ptr_idx')
         ptr_val = self.alloc_scratch('ptr_val')
         ptr_idx_st = self.alloc_scratch('ptr_idx_st')
@@ -393,6 +391,14 @@ class KernelBuilder:
             body.append(('valu', ('>>', regs['tmp'], regs['val'], vec_consts[16])))
             body.append(('valu', ('^', regs['val'], regs['nv'], regs['tmp'])))
 
+        def gen_idx_update_valu(chunk_idx, wrap=False):
+            regs = chunk_regs[chunk_idx]
+            body.append(('valu', ('&', regs['nv'], regs['val'], vec_consts[1])))
+            body.append(('valu', ('multiply_add', regs['idx'], regs['idx'], vec_consts[2], vec_consts[1])))
+            body.append(('valu', ('+', regs['idx'], regs['idx'], regs['nv'])))
+            if wrap:
+                body.append(('valu', ('&', regs['idx'], regs['idx'], vec_consts[0])))
+
         def gen_idx_update_alu(chunk_idx, wrap=False):
             regs = chunk_regs[chunk_idx]
             for vi in range(VLEN):
@@ -407,33 +413,20 @@ class KernelBuilder:
                 if wrap:
                     body.append(('alu', ('&', idx, idx, consts[0])))
 
-        def gen_idx_update_valu(chunk_idx, wrap=False):
-            regs = chunk_regs[chunk_idx]
-            body.append(('valu', ('&', regs['nv'], regs['val'], vec_consts[1])))
-            body.append(('valu', ('multiply_add', regs['idx'], regs['idx'], vec_consts[2], vec_consts[1])))
-            body.append(('valu', ('+', regs['idx'], regs['idx'], regs['nv'])))
-            if wrap:
-                body.append(('valu', ('&', regs['idx'], regs['idx'], vec_consts[0])))
-
-        # PEER OPTIMIZATION: Use pure ALU arithmetic for Round 1 (not FLOW select)
-        # This uses precomputed diff_2_1 = vec_nodes[2] - vec_nodes[1]
-        # nv = (idx - 1) * diff_2_1 + vec_nodes[1]
         def gen_node_val_r1_alu(chunk_idx):
             regs = chunk_regs[chunk_idx]
             for vi in range(VLEN):
                 idx = regs['idx'] + vi
                 nv  = regs['nv'] + vi
                 tmp = regs['tmp'] + vi
-                body.append(('alu', ('-', tmp, idx, consts[1])))
-                body.append(('alu', ('*', tmp, tmp, diff_2_1 + vi)))
-                body.append(('alu', ('+', nv, tmp, vec_nodes[1] + vi)))
+                body.append(('alu', ('==', tmp, idx, consts[1])))
+                body.append(('flow', ('select', nv, tmp, vec_nodes[1], vec_nodes[2])))
 
         def gen_node_val_r1_valu(chunk_idx):
             regs = chunk_regs[chunk_idx]
             body.append(('valu', ('==', regs['tmp'], regs['idx'], vec_consts[1])))
             body.append(('flow', ('vselect', regs['nv'], regs['tmp'], vec_nodes[1], vec_nodes[2])))
 
-        # PEER OPTIMIZATION: Use pure ALU accumulation for Round 2 (not FLOW select)
         def gen_node_val_r2_alu(chunk_idx):
             regs = chunk_regs[chunk_idx]
             for vi in range(VLEN):
@@ -484,6 +477,7 @@ class KernelBuilder:
         r = 0
         while r < rounds:
             if r == 0 or r == wrap_round:
+                # Round 0: All chunks use node 0
                 for chunk in range(ALU_CHUNKS, num_chunks):
                     regs = chunk_regs[chunk]
                     gen_hash_valu(chunk, node_val_is_vec=True, node_val_vec=vec_nodes[0])
@@ -501,6 +495,7 @@ class KernelBuilder:
                 r += 1
 
             elif r == 1 or r == wrap_round + 1:
+                # Round 1: nodes 1 or 2
                 for chunk in range(ALU_CHUNKS, num_chunks):
                     gen_node_val_r1_valu(chunk)
                     gen_hash_valu(chunk)
@@ -512,11 +507,13 @@ class KernelBuilder:
                 r += 1
 
             elif r == 2 or r == wrap_round + 2:
+                # Round 2: nodes 3, 4, 5, or 6
                 for chunk in range(ALU_CHUNKS, num_chunks):
                     regs = chunk_regs[chunk]
                     gen_node_val_r2_valu(chunk)
                     gen_hash_valu(chunk)
                     gen_idx_update_valu(chunk)
+                    # Pre-compute addresses for round 3 while doing hash
                     if C_FLOW3 <= chunk < C_LOAD3_END:
                         for vi in range(VLEN):
                             body.append(('alu', ('+', regs['tmp'] + vi, fvp, regs['idx'] + vi)))
@@ -531,19 +528,22 @@ class KernelBuilder:
                 r += 1
 
             elif r == 3 or r == wrap_round + 3:
+                # Round 3: nodes 7-14 (8 nodes)
                 c_flow = C_FLOW3
                 c_load = C_LOAD3
 
+                # Phase 1: All scattered loads (separated for better VLIW packing)
                 for chunk in range(c_flow, c_flow + c_load):
                     regs = chunk_regs[chunk]
                     for vi in range(VLEN):
                         body.append(('load', ('load', regs['nv'] + vi, regs['tmp'] + vi)))
 
+                # Phase 2: All node selections + hash + idx update
                 for chunk in range(num_chunks):
                     if chunk < c_flow:
                         gen_node_val_flow(chunk, 7, 8)
                     elif chunk < c_flow + c_load:
-                        pass
+                        pass  # Already loaded
                     else:
                         gen_node_val_alu(chunk, 7, 8)
 
@@ -554,6 +554,7 @@ class KernelBuilder:
                         gen_hash_valu(chunk)
                         gen_idx_update_valu(chunk)
 
+                    # Pre-compute addresses for round 4
                     if C_FLOW4 <= chunk < C_LOAD4_END:
                         regs = chunk_regs[chunk]
                         for vi in range(VLEN):
@@ -561,20 +562,23 @@ class KernelBuilder:
                 r += 1
 
             elif r == 4 or r == wrap_round + 4:
+                # Round 4: nodes 15-30 (16 nodes)
                 c_flow = C_FLOW4
                 c_load = C_LOAD4
                 is_last_round = (r == wrap_round + 4)
 
+                # Phase 1: All scattered loads
                 for chunk in range(c_flow, c_flow + c_load):
                     regs = chunk_regs[chunk]
                     for vi in range(VLEN):
                         body.append(('load', ('load', regs['nv'] + vi, regs['tmp'] + vi)))
 
+                # Phase 2: All node selections + hash + idx update + stores
                 for chunk in range(num_chunks):
                     if chunk < c_flow:
                         gen_node_val_flow(chunk, 15, 16)
                     elif chunk < c_flow + c_load:
-                        pass
+                        pass  # Already loaded
                     else:
                         gen_node_val_alu(chunk, 15, 16)
 
@@ -585,12 +589,13 @@ class KernelBuilder:
                         gen_hash_valu(chunk)
                         gen_idx_update_valu(chunk)
 
+                    # Compute addresses for round 5 on first pass
                     if r == 4 and r + 1 < rounds and r + 1 != wrap_round:
                         regs = chunk_regs[chunk]
                         for vi in range(VLEN):
                             body.append(('alu', ('+', regs['tmp'] + vi, fvp, regs['idx'] + vi)))
 
-                    # Store results interleaved with computation
+                    # Overlap STORE with computation
                     if is_last_round:
                         regs = chunk_regs[chunk]
                         body.append(('store', ('vstore', ptr_idx_st, regs['idx'])))
@@ -601,27 +606,32 @@ class KernelBuilder:
                 r += 1
 
             elif r == 5 or r == wrap_round + 5:
+                # Round 5: nodes 31-62 (dynamic loading)
                 c_flow = min(num_chunks, c_flow5)
                 c_alu = min(num_chunks - c_flow, 1)
                 c_load = num_chunks - c_flow - c_alu
 
+                # Clear nv for FLOW chunks
                 for chunk in range(c_flow):
                     regs = chunk_regs[chunk]
                     body.append(('valu', ('&', regs['nv'], regs['nv'], vec_consts[0])))
 
+                # Clear nv for ALU chunks
                 for chunk in range(c_flow, c_flow + c_alu):
                     regs = chunk_regs[chunk]
                     for vi in range(VLEN):
                         body.append(('alu', ('&', regs['nv'] + vi, regs['nv'] + vi, consts[0])))
 
+                # Scattered loads for remaining chunks
                 for chunk in range(c_flow + c_alu, num_chunks):
                     regs = chunk_regs[chunk]
                     for vi in range(VLEN):
                         body.append(('load', ('load', regs['nv'] + vi, regs['tmp'] + vi)))
 
-                body.append(('alu', ('+', scalar_reg, consts[24], consts[7])))
-                body.append(('alu', ('+', addr_reg, consts[24], consts[7])))
-                body.append(('alu', ('+', addr_reg, fvp, addr_reg)))
+                # Dynamic loading of node values 31-62 for FLOW/ALU chunks
+                body.append(('alu', ('+', scalar_reg, consts[24], consts[7])))  # scalar_reg = 31
+                body.append(('alu', ('+', addr_reg, consts[24], consts[7])))     # addr_reg = 31
+                body.append(('alu', ('+', addr_reg, fvp, addr_reg)))              # addr_reg = &forest_values[31]
 
                 for i in range(32):
                     if i % 8 == 0:
@@ -648,6 +658,7 @@ class KernelBuilder:
 
                     body.append(('alu', ('+', scalar_reg, scalar_reg, consts[1])))
 
+                # Hash + idx update + address computation
                 for chunk in range(num_chunks):
                     if chunk >= num_chunks - ALU_CHUNKS:
                         gen_hash_alu(chunk)
@@ -656,6 +667,7 @@ class KernelBuilder:
                         gen_hash_valu(chunk)
                         gen_idx_update_valu(chunk)
 
+                    # Compute addresses for round 6
                     if r == 5 and r + 1 < rounds and r + 1 != wrap_round:
                         regs = chunk_regs[chunk]
                         for vi in range(VLEN):
@@ -663,10 +675,11 @@ class KernelBuilder:
                 r += 1
 
             else:
-                # General scattered round handler
+                # General scattered round handler (rounds 6+)
                 do_wrap = (r == wrap_round - 1)
                 is_last_scattered = (r == rounds - 1) or (r == wrap_round - 1 and wrap_round > rounds - 1)
 
+                # Phase-separated scattered loads
                 for chunk in range(num_chunks):
                     regs = chunk_regs[chunk]
                     for vi in range(VLEN):
@@ -737,7 +750,7 @@ def do_kernel_test(
         ), f'Incorrect result on round {i}'
         inp_indices_p = ref_mem[5]
         if prints:
-            print(machine.mem[inp_indices_p : inp_values_p + len(inp.indices)])
+            print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
             print(ref_mem[inp_indices_p : ref_mem[5] + len(inp.indices)])
 
     print('CYCLES: ', machine.cycle)
