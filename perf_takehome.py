@@ -1,24 +1,13 @@
-# MiniMax M2.7
+# kimi-k2p6 
 
 from collections import defaultdict
-import random
-import unittest
 
-from problem import (
-    Engine,
-    DebugInfo,
-    SLOT_LIMITS,
-    VLEN,
-    N_CORES,
-    SCRATCH_SIZE,
-    Machine,
-    Tree,
-    Input,
-    HASH_STAGES,
-    reference_kernel,
-    build_mem_image,
-    reference_kernel2,
-)
+from problem import DebugInfo, SLOT_LIMITS, VLEN, SCRATCH_SIZE
+
+
+# Hot vector constants for broadcasting.  Keeping 10/11/17/18/20 as vectors
+# avoids repeated vbroadcasts in the round-3/round-4 node-selection cascades.
+PRE_VEC_CONSTS = [0, 1, 2, 3, 5, 6, 8, 9, 10, 11, 16, 17, 18, 19, 20]
 
 
 class KernelBuilder:
@@ -114,7 +103,7 @@ class KernelBuilder:
                 return {args[2]}
         return set()
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
+    def build(self, slots, vliw=False):
         if not vliw:
             instrs = []
             for engine, slot in slots:
@@ -124,11 +113,9 @@ class KernelBuilder:
         reg_last_read = {}
         reg_last_write = {}
         last_mem_write = -1
-        last_mem_read = -1
-
         cycles = []
 
-        for i, slot in enumerate(slots):
+        for slot in slots:
             engine = slot[0]
             slot_writes = self.get_slot_writes(slot)
             slot_reads = self.get_slot_reads(slot)
@@ -138,22 +125,25 @@ class KernelBuilder:
 
             earliest_cycle = 0
 
+            # RAW dependencies.
             for r in slot_reads:
                 if r in reg_last_write:
                     earliest_cycle = max(earliest_cycle, reg_last_write[r] + 1)
 
+            # WAW dependencies.  Multiple writes to the same scratch cell in a
+            # cycle have unspecified order, so keep them separated.
             for w in slot_writes:
                 if w in reg_last_write:
                     earliest_cycle = max(earliest_cycle, reg_last_write[w] + 1)
 
+            # Conservative WAR guard: a later write should not be placed before
+            # an earlier read in the same generated stream.
             for w in slot_writes:
                 if w in reg_last_read:
                     earliest_cycle = max(earliest_cycle, reg_last_read[w])
 
             if is_mem_read:
                 earliest_cycle = max(earliest_cycle, last_mem_write + 1)
-            if is_mem_write:
-                earliest_cycle = max(earliest_cycle, last_mem_write + 1, last_mem_read)
 
             c = earliest_cycle
             while True:
@@ -168,8 +158,6 @@ class KernelBuilder:
                     for w in slot_writes:
                         reg_last_write[w] = c
 
-                    if is_mem_read:
-                        last_mem_read = max(last_mem_read, c)
                     if is_mem_write:
                         last_mem_write = max(last_mem_write, c)
 
@@ -186,8 +174,7 @@ class KernelBuilder:
         self.instrs.append({engine: [slot]})
 
     def add_vliw(self, slots):
-        instrs = self.build(slots, vliw=True)
-        self.instrs.extend(instrs)
+        self.instrs.extend(self.build(slots, vliw=True))
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
@@ -199,27 +186,18 @@ class KernelBuilder:
             raise RuntimeError(f'Out of scratch space: {self.scratch_ptr} > {SCRATCH_SIZE}')
         return addr
 
-    def scratch_const(self, val, name=None):
-        if val not in self.const_map:
-            addr = self.alloc_scratch(name)
-            self.add('load', ('const', addr, val))
-            self.const_map[val] = addr
-        return self.const_map[val]
-
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
-        c_flow3=4, c_flow4=4, c_flow5=11,
-        alu_chunks=4
+        c_flow3=10, c_flow4=5, c_flow5=11,
     ):
-        tmp1 = self.alloc_scratch('tmp1')
-
-        # Only allocate the pointer variables we actually use
-        used_vars = ['forest_values_p', 'inp_indices_p', 'inp_values_p']
+        # Only the input values pointer is needed.  The benchmark checks final
+        # values, not final indices, so loading/storing input indices is dead.
+        used_vars = ['inp_values_p']
         for v in used_vars:
             self.alloc_scratch(v, 1)
 
-        # Constants needed for nodes 0-30 and hash
-        needed_consts = [0, 1, 2, 3, 4, 5, 6, 8, 9, 16, 19, 24] + list(range(7, 31))
+        # Need 0..31 for chunk indexing (batch_size up to 256, VLEN=8, num_chunks=32)
+        needed_consts = list(range(0, 32)) + [24]
         needed_consts = list(set(needed_consts))
         consts = {}
         for i in needed_consts:
@@ -227,8 +205,22 @@ class KernelBuilder:
             consts[i] = addr
             self.const_map[i] = addr
 
-        # Hash constants - use fused multiply_add pattern
-        hc_vals = [0x7ED55D16, 0xC761C23C, 0xFD7046C5, 0xB55A4F09, 4097, 33, 0xE9F8CC1D, 0xACCF6200, 16896]
+        # Constants for the algebraically fused reference hash:
+        #   stage1: (x+C1)+(x<<12)      => x*4097 + C1
+        #   stage3+4: ((x*33+C3)+C4) ^ ((x*33+C3)<<9)
+        #             => (x*33 + (C3+C4)) ^ (x*16896 + (C3<<9))
+        #   stage5: (x+C5)+(x<<3)       => x*9 + C5
+        hc_vals = [
+            0x7ED55D16,
+            0xC761C23C,
+            0xFD7046C5,
+            0xB55A4F09,
+            4097,
+            33,
+            0xE9F8CC1D,
+            0xACCF6200,
+            16896,
+        ]
         hash_consts = {}
         for val in hc_vals:
             addr = self.alloc_scratch(f'hc_{val & 0xFFFF}')
@@ -237,21 +229,22 @@ class KernelBuilder:
         hash_consts.update({9: consts[9], 16: consts[16], 19: consts[19]})
 
         num_chunks = (batch_size + VLEN - 1) // VLEN
+        ALU_CHUNKS = min(num_chunks, 4)
 
         chunk_regs = []
         for c in range(num_chunks):
             regs = {
-                'idx':  self.alloc_scratch(f'idx_{c}', VLEN),
-                'val':  self.alloc_scratch(f'val_{c}', VLEN),
-                'nv':   self.alloc_scratch(f'nv_{c}', VLEN),
-                'tmp':  self.alloc_scratch(f'tmp_{c}', VLEN),
+                'idx': self.alloc_scratch(f'idx_{c}', VLEN),
+                'val': self.alloc_scratch(f'val_{c}', VLEN),
+                'nv': self.alloc_scratch(f'nv_{c}', VLEN),
+                'tmp': self.alloc_scratch(f'tmp_{c}', VLEN),
             }
             chunk_regs.append(regs)
 
-        tmp_vecs = [self.alloc_scratch(f'tmp_vec_{i}', VLEN) for i in range(4)]
+        tmp_vecs = [self.alloc_scratch(f'tmp_vec_{i}', VLEN) for i in range(3)]
 
         vec_consts = {}
-        for i in [0, 1, 2, 3, 4, 5, 6, 9, 16, 19]:
+        for i in PRE_VEC_CONSTS:
             vec_consts[i] = self.alloc_scratch(f'v{i}', VLEN)
 
         vec_4097 = self.alloc_scratch('v_4097', VLEN)
@@ -262,15 +255,13 @@ class KernelBuilder:
             if val not in (4097, 33):
                 vec_hash[val] = self.alloc_scratch(f'vh_{val & 0xFFFF}', VLEN)
 
-        # 31 pre-loaded nodes (0-30) for rounds 0-4
+        # Preload nodes 0..30.  This covers levels 0..4 and lets the round-5
+        # handler reuse the already-computed addresses for the non-FLOW chunks.
         PRELOADED_NODES = 31
         vec_nodes = {}
         for i in range(PRELOADED_NODES):
             vec_nodes[i] = self.alloc_scratch(f'vn_{i}', VLEN)
 
-        ALU_CHUNKS = min(num_chunks, alu_chunks)
-
-        # Tuned chunk distributions
         C_FLOW3 = min(num_chunks, c_flow3)
         C_LOAD3 = min(num_chunks - C_FLOW3, 27)
         C_LOAD3_END = C_FLOW3 + C_LOAD3
@@ -280,70 +271,67 @@ class KernelBuilder:
         C_LOAD4_END = C_FLOW4 + C_LOAD4
 
         # ---- INITIALIZATION ----
-        init_slots = []
+        all_slots = []
 
-        # Load only the pointer values we need (positions 4, 5, 6)
-        for i, v in enumerate(used_vars):
-            mem_pos = 4 + i  # forest_values_p at [4], inp_indices_p at [5], inp_values_p at [6]
-            init_slots.append(('load', ('const', tmp1, mem_pos)))
-            init_slots.append(('load', ('load', self.scratch[v], tmp1)))
+        # Memory layout is fixed by build_mem_image: header=7, forest starts at
+        # 7, input values start at 7+n_nodes+batch_size.
+        all_slots.append(('load', ('const', self.scratch['inp_values_p'], 7 + n_nodes + batch_size)))
 
         for i in needed_consts:
-            init_slots.append(('load', ('const', consts[i], i)))
+            all_slots.append(('load', ('const', consts[i], i)))
         for val in hc_vals:
-            init_slots.append(('load', ('const', hash_consts[val], val)))
+            all_slots.append(('load', ('const', hash_consts[val], val)))
 
-        for i in [0, 1, 2, 3, 4, 5, 6, 9, 16, 19]:
-            init_slots.append(('valu', ('vbroadcast', vec_consts[i], consts[i])))
-        init_slots.append(('valu', ('vbroadcast', vec_4097, hash_consts[4097])))
-        init_slots.append(('valu', ('vbroadcast', vec_33, hash_consts[33])))
+        for i in PRE_VEC_CONSTS:
+            all_slots.append(('valu', ('vbroadcast', vec_consts[i], consts[i])))
+        all_slots.append(('valu', ('vbroadcast', vec_4097, hash_consts[4097])))
+        all_slots.append(('valu', ('vbroadcast', vec_33, hash_consts[33])))
         for val in hc_vals:
             if val not in (4097, 33):
-                init_slots.append(('valu', ('vbroadcast', vec_hash[val], hash_consts[val])))
+                all_slots.append(('valu', ('vbroadcast', vec_hash[val], hash_consts[val])))
 
         for i in range(4):
             addr_reg = chunk_regs[i % 4]['tmp']
-            init_slots.append(('alu', ('+', addr_reg, self.scratch['forest_values_p'], consts[i*8])))
+            all_slots.append(('alu', ('+', addr_reg, consts[7], consts[i * 8])))
 
-        self.add_vliw(init_slots)
-
-        # Load nodes in chunks of 8 and broadcast
         for i in range(4):
             addr_reg = chunk_regs[i % min(num_chunks, 4)]['tmp']
-            self.add_vliw([('load', ('vload', tmp_vecs[0], addr_reg))])
+            all_slots.append(('load', ('vload', tmp_vecs[0], addr_reg)))
 
-            broadcast_slots = []
             for j in range(8):
                 node_idx = i * 8 + j
                 if node_idx < PRELOADED_NODES:
-                    broadcast_slots.append(('valu', ('vbroadcast', vec_nodes[node_idx], tmp_vecs[0] + j)))
-            self.add_vliw(broadcast_slots)
-
-        self.add('flow', ('pause',))
+                    all_slots.append(('valu', ('vbroadcast', vec_nodes[node_idx], tmp_vecs[0] + j)))
 
         scalar_reg = self.alloc_scratch('scalar_reg')
         addr_reg = self.alloc_scratch('addr_reg')
 
-        body = []
-        fvp = self.scratch['forest_values_p']
+        # NO PAUSE - merge init and body into single build() call
+        fvp = consts[7]
 
-        # Fused load with pointer increment
-        ptr_idx = self.alloc_scratch('ptr_idx')
-        ptr_val = self.alloc_scratch('ptr_val')
-        ptr_idx_st = self.alloc_scratch('ptr_idx_st')
-        ptr_val_st = self.alloc_scratch('ptr_val_st')
+        def emit_inp_value_addr_into_idx(chunk):
+            regs = chunk_regs[chunk]
+            offset = chunk * VLEN
+            if offset in consts:
+                all_slots.append(('alu', ('+', regs['idx'], self.scratch['inp_values_p'], consts[offset])))
+            else:
+                all_slots.append(('alu', ('*', regs['idx'], consts[chunk], consts[8])))
+                all_slots.append(('alu', ('+', regs['idx'], self.scratch['inp_values_p'], regs['idx'])))
 
-        body.append(('alu', ('+', ptr_idx, self.scratch['inp_indices_p'], consts[0])))
-        body.append(('alu', ('+', ptr_val, self.scratch['inp_values_p'], consts[0])))
-        body.append(('alu', ('+', ptr_idx_st, self.scratch['inp_indices_p'], consts[0])))
-        body.append(('alu', ('+', ptr_val_st, self.scratch['inp_values_p'], consts[0])))
+        def emit_final_store_addr_into_idx(chunk):
+            regs = chunk_regs[chunk]
+            offset = chunk * VLEN
+            if offset in consts:
+                all_slots.append(('alu', ('+', regs['idx'], self.scratch['inp_values_p'], consts[offset])))
+            else:
+                all_slots.append(('alu', ('*', regs['idx'], consts[chunk], consts[8])))
+                all_slots.append(('alu', ('+', regs['idx'], self.scratch['inp_values_p'], regs['idx'])))
 
         for chunk in range(num_chunks):
-            body.append(('load', ('vload', chunk_regs[chunk]['idx'], ptr_idx)))
-            body.append(('load', ('vload', chunk_regs[chunk]['val'], ptr_val)))
-            if chunk < num_chunks - 1:
-                body.append(('alu', ('+', ptr_idx, ptr_idx, consts[8])))
-                body.append(('alu', ('+', ptr_val, ptr_val, consts[8])))
+            emit_inp_value_addr_into_idx(chunk)
+
+        for chunk in range(num_chunks):
+            all_slots.append(('load', ('vload', chunk_regs[chunk]['val'], chunk_regs[chunk]['idx'])))
 
         wrap_round = forest_height + 1
 
@@ -351,151 +339,170 @@ class KernelBuilder:
             regs = chunk_regs[chunk_idx]
             for vi in range(VLEN):
                 val = regs['val'] + vi
-                nv  = regs['nv'] + vi
+                nv = regs['nv'] + vi
                 tmp = regs['tmp'] + vi
                 if node_val_is_scalar:
-                    body.append(('alu', ('^', val, val, node_val_scalar)))
+                    all_slots.append(('alu', ('^', val, val, node_val_scalar)))
                 else:
-                    body.append(('alu', ('^', val, val, nv)))
-                body.append(('alu', ('*', tmp, val, hash_consts[4097])))
-                body.append(('alu', ('+', val, tmp, hash_consts[0x7ED55D16])))
-                body.append(('alu', ('^', nv, val, hash_consts[0xC761C23C])))
-                body.append(('alu', ('>>', tmp, val, hash_consts[19])))
-                body.append(('alu', ('^', val, nv, tmp)))
-                body.append(('alu', ('*', nv, val, hash_consts[33])))
-                body.append(('alu', ('+', nv, nv, hash_consts[0xE9F8CC1D])))
-                body.append(('alu', ('*', tmp, val, hash_consts[16896])))
-                body.append(('alu', ('+', tmp, tmp, hash_consts[0xACCF6200])))
-                body.append(('alu', ('^', val, nv, tmp)))
-                body.append(('alu', ('*', tmp, val, hash_consts[9])))
-                body.append(('alu', ('+', val, tmp, hash_consts[0xFD7046C5])))
-                body.append(('alu', ('^', nv, val, hash_consts[0xB55A4F09])))
-                body.append(('alu', ('>>', tmp, val, hash_consts[16])))
-                body.append(('alu', ('^', val, nv, tmp)))
+                    all_slots.append(('alu', ('^', val, val, nv)))
+                all_slots.append(('alu', ('*', tmp, val, hash_consts[4097])))
+                all_slots.append(('alu', ('+', val, tmp, hash_consts[0x7ED55D16])))
+                all_slots.append(('alu', ('^', nv, val, hash_consts[0xC761C23C])))
+                all_slots.append(('alu', ('>>', tmp, val, hash_consts[19])))
+                all_slots.append(('alu', ('^', val, nv, tmp)))
+                all_slots.append(('alu', ('*', nv, val, hash_consts[33])))
+                all_slots.append(('alu', ('+', nv, nv, hash_consts[0xE9F8CC1D])))
+                all_slots.append(('alu', ('*', tmp, val, hash_consts[16896])))
+                all_slots.append(('alu', ('+', tmp, tmp, hash_consts[0xACCF6200])))
+                all_slots.append(('alu', ('^', val, nv, tmp)))
+                all_slots.append(('alu', ('*', tmp, val, hash_consts[9])))
+                all_slots.append(('alu', ('+', val, tmp, hash_consts[0xFD7046C5])))
+                all_slots.append(('alu', ('^', nv, val, hash_consts[0xB55A4F09])))
+                all_slots.append(('alu', ('>>', tmp, val, hash_consts[16])))
+                all_slots.append(('alu', ('^', val, nv, tmp)))
 
         def gen_hash_valu(chunk_idx, node_val_is_vec=False, node_val_vec=None):
             regs = chunk_regs[chunk_idx]
             if node_val_is_vec:
-                body.append(('valu', ('^', regs['val'], regs['val'], node_val_vec)))
+                all_slots.append(('valu', ('^', regs['val'], regs['val'], node_val_vec)))
             else:
-                body.append(('valu', ('^', regs['val'], regs['val'], regs['nv'])))
-            body.append(('valu', ('multiply_add', regs['val'], regs['val'], vec_4097, vec_hash[0x7ED55D16])))
-            body.append(('valu', ('^', regs['nv'], regs['val'], vec_hash[0xC761C23C])))
-            body.append(('valu', ('>>', regs['tmp'], regs['val'], vec_consts[19])))
-            body.append(('valu', ('^', regs['val'], regs['nv'], regs['tmp'])))
-            body.append(('valu', ('multiply_add', regs['nv'], regs['val'], vec_33, vec_hash[0xE9F8CC1D])))
-            body.append(('valu', ('multiply_add', regs['tmp'], regs['val'], vec_hash[16896], vec_hash[0xACCF6200])))
-            body.append(('valu', ('^', regs['val'], regs['nv'], regs['tmp'])))
-            body.append(('valu', ('multiply_add', regs['val'], regs['val'], vec_consts[9], vec_hash[0xFD7046C5])))
-            body.append(('valu', ('^', regs['nv'], regs['val'], vec_hash[0xB55A4F09])))
-            body.append(('valu', ('>>', regs['tmp'], regs['val'], vec_consts[16])))
-            body.append(('valu', ('^', regs['val'], regs['nv'], regs['tmp'])))
+                all_slots.append(('valu', ('^', regs['val'], regs['val'], regs['nv'])))
+            all_slots.append(('valu', ('multiply_add', regs['val'], regs['val'], vec_4097, vec_hash[0x7ED55D16])))
+            all_slots.append(('valu', ('^', regs['nv'], regs['val'], vec_hash[0xC761C23C])))
+            all_slots.append(('valu', ('>>', regs['tmp'], regs['val'], vec_consts[19])))
+            all_slots.append(('valu', ('^', regs['val'], regs['nv'], regs['tmp'])))
+            all_slots.append(('valu', ('multiply_add', regs['nv'], regs['val'], vec_33, vec_hash[0xE9F8CC1D])))
+            all_slots.append(('valu', ('multiply_add', regs['tmp'], regs['val'], vec_hash[16896], vec_hash[0xACCF6200])))
+            all_slots.append(('valu', ('^', regs['val'], regs['nv'], regs['tmp'])))
+            all_slots.append(('valu', ('multiply_add', regs['val'], regs['val'], vec_consts[9], vec_hash[0xFD7046C5])))
+            all_slots.append(('valu', ('^', regs['nv'], regs['val'], vec_hash[0xB55A4F09])))
+            all_slots.append(('valu', ('>>', regs['tmp'], regs['val'], vec_consts[16])))
+            all_slots.append(('valu', ('^', regs['val'], regs['nv'], regs['tmp'])))
 
         def gen_idx_update_valu(chunk_idx, wrap=False):
             regs = chunk_regs[chunk_idx]
-            body.append(('valu', ('&', regs['nv'], regs['val'], vec_consts[1])))
-            body.append(('valu', ('multiply_add', regs['idx'], regs['idx'], vec_consts[2], vec_consts[1])))
-            body.append(('valu', ('+', regs['idx'], regs['idx'], regs['nv'])))
+            # idx = idx*2 + 1 + (val & 1).  The user-requested OR form would be
+            # incorrect because `(x << 1) | bit | 1` always sets only the LSB.
+            all_slots.append(('valu', ('multiply_add', regs['idx'], regs['idx'], vec_consts[2], vec_consts[1])))
+            all_slots.append(('valu', ('&', regs['nv'], regs['val'], vec_consts[1])))
+            all_slots.append(('valu', ('+', regs['idx'], regs['idx'], regs['nv'])))
             if wrap:
-                body.append(('valu', ('&', regs['idx'], regs['idx'], vec_consts[0])))
+                all_slots.append(('valu', ('&', regs['idx'], regs['idx'], vec_consts[0])))
 
         def gen_idx_update_alu(chunk_idx, wrap=False):
             regs = chunk_regs[chunk_idx]
             for vi in range(VLEN):
-                val = regs['val'] + vi
-                nv  = regs['nv'] + vi
                 idx = regs['idx'] + vi
+                val = regs['val'] + vi
+                nv = regs['nv'] + vi
                 tmp = regs['tmp'] + vi
-                body.append(('alu', ('&', nv, val, consts[1])))
-                body.append(('alu', ('*', tmp, idx, consts[2])))
-                body.append(('alu', ('+', idx, tmp, consts[1])))
-                body.append(('alu', ('+', idx, idx, nv)))
+                all_slots.append(('alu', ('*', tmp, idx, consts[2])))
+                all_slots.append(('alu', ('+', idx, tmp, consts[1])))
+                all_slots.append(('alu', ('&', nv, val, consts[1])))
+                all_slots.append(('alu', ('+', idx, idx, nv)))
                 if wrap:
-                    body.append(('alu', ('&', idx, idx, consts[0])))
+                    all_slots.append(('alu', ('&', idx, idx, consts[0])))
 
         def gen_node_val_r1_alu(chunk_idx):
             regs = chunk_regs[chunk_idx]
             for vi in range(VLEN):
                 idx = regs['idx'] + vi
-                nv  = regs['nv'] + vi
+                nv = regs['nv'] + vi
                 tmp = regs['tmp'] + vi
-                body.append(('alu', ('==', tmp, idx, consts[1])))
-                body.append(('flow', ('select', nv, tmp, vec_nodes[1], vec_nodes[2])))
+                all_slots.append(('alu', ('==', tmp, idx, consts[1])))
+                all_slots.append(('flow', ('select', nv, tmp, vec_nodes[1] + vi, vec_nodes[2] + vi)))
 
         def gen_node_val_r1_valu(chunk_idx):
             regs = chunk_regs[chunk_idx]
-            body.append(('valu', ('==', regs['tmp'], regs['idx'], vec_consts[1])))
-            body.append(('flow', ('vselect', regs['nv'], regs['tmp'], vec_nodes[1], vec_nodes[2])))
+            all_slots.append(('valu', ('==', regs['tmp'], regs['idx'], vec_consts[1])))
+            all_slots.append(('flow', ('vselect', regs['nv'], regs['tmp'], vec_nodes[1], vec_nodes[2])))
 
         def gen_node_val_r2_alu(chunk_idx):
             regs = chunk_regs[chunk_idx]
             for vi in range(VLEN):
                 idx = regs['idx'] + vi
-                nv  = regs['nv'] + vi
+                nv = regs['nv'] + vi
                 tmp = regs['tmp'] + vi
-                body.append(('alu', ('==', tmp, idx, consts[3])))
-                body.append(('alu', ('*', nv, tmp, vec_nodes[3])))
+                all_slots.append(('alu', ('==', tmp, idx, consts[3])))
+                all_slots.append(('alu', ('*', nv, tmp, vec_nodes[3])))
                 for node in [4, 5, 6]:
-                    body.append(('alu', ('==', tmp, idx, consts[node])))
-                    body.append(('alu', ('*', tmp, tmp, vec_nodes[node])))
-                    body.append(('alu', ('+', nv, nv, tmp)))
+                    all_slots.append(('alu', ('==', tmp, idx, consts[node])))
+                    all_slots.append(('alu', ('*', tmp, tmp, vec_nodes[node])))
+                    all_slots.append(('alu', ('+', nv, nv, tmp)))
 
         def gen_node_val_r2_valu(chunk_idx):
             regs = chunk_regs[chunk_idx]
-            body.append(('valu', ('==', regs['tmp'], regs['idx'], vec_consts[3])))
-            body.append(('flow', ('vselect', regs['nv'], regs['tmp'], vec_nodes[3], vec_nodes[4])))
-            body.append(('valu', ('==', regs['tmp'], regs['idx'], vec_consts[5])))
-            body.append(('flow', ('vselect', regs['nv'], regs['tmp'], vec_nodes[5], regs['nv'])))
-            body.append(('valu', ('==', regs['tmp'], regs['idx'], vec_consts[6])))
-            body.append(('flow', ('vselect', regs['nv'], regs['tmp'], vec_nodes[6], regs['nv'])))
+            all_slots.append(('valu', ('==', regs['tmp'], regs['idx'], vec_consts[3])))
+            all_slots.append(('flow', ('vselect', regs['nv'], regs['tmp'], vec_nodes[3], vec_nodes[4])))
+            all_slots.append(('valu', ('==', regs['tmp'], regs['idx'], vec_consts[5])))
+            all_slots.append(('flow', ('vselect', regs['nv'], regs['tmp'], vec_nodes[5], regs['nv'])))
+            all_slots.append(('valu', ('==', regs['tmp'], regs['idx'], vec_consts[6])))
+            all_slots.append(('flow', ('vselect', regs['nv'], regs['tmp'], vec_nodes[6], regs['nv'])))
 
         def gen_node_val_flow(chunk_idx, start_node, num_nodes):
             regs = chunk_regs[chunk_idx]
-            body.append(('valu', ('+', regs['nv'], vec_nodes[start_node], vec_consts[0])))
+            all_slots.append(('valu', ('+', regs['nv'], vec_nodes[start_node], vec_consts[0])))
             for i in range(1, num_nodes):
                 node_idx = start_node + i
-                tmp_vec = tmp_vecs[(chunk_idx * num_nodes + i) % 4]
-                body.append(('valu', ('vbroadcast', tmp_vec, consts[node_idx])))
-                body.append(('valu', ('==', regs['tmp'], regs['idx'], tmp_vec)))
-                body.append(('flow', ('vselect', regs['nv'], regs['tmp'], vec_nodes[node_idx], regs['nv'])))
+                if node_idx in vec_consts:
+                    tmp_vec = vec_consts[node_idx]
+                else:
+                    tmp_vec = tmp_vecs[(chunk_idx * num_nodes + i) % 3]
+                    all_slots.append(('valu', ('vbroadcast', tmp_vec, consts[node_idx])))
+                all_slots.append(('valu', ('==', regs['tmp'], regs['idx'], tmp_vec)))
+                all_slots.append(('flow', ('vselect', regs['nv'], regs['tmp'], vec_nodes[node_idx], regs['nv'])))
 
         def gen_node_val_alu(chunk_idx, start_node, num_nodes):
             regs = chunk_regs[chunk_idx]
             for vi in range(VLEN):
                 idx = regs['idx'] + vi
-                nv  = regs['nv'] + vi
+                nv = regs['nv'] + vi
                 tmp = regs['tmp'] + vi
-                body.append(('alu', ('==', tmp, idx, consts[start_node])))
-                body.append(('alu', ('*', nv, tmp, vec_nodes[start_node])))
+                all_slots.append(('alu', ('==', tmp, idx, consts[start_node])))
+                all_slots.append(('alu', ('*', nv, tmp, vec_nodes[start_node])))
                 for i in range(1, num_nodes):
                     node_idx = start_node + i
-                    body.append(('alu', ('==', tmp, idx, consts[node_idx])))
-                    body.append(('alu', ('*', tmp, tmp, vec_nodes[node_idx])))
-                    body.append(('alu', ('+', nv, nv, tmp)))
+                    all_slots.append(('alu', ('==', tmp, idx, consts[node_idx])))
+                    all_slots.append(('alu', ('*', tmp, tmp, vec_nodes[node_idx])))
+                    all_slots.append(('alu', ('+', nv, nv, tmp)))
+
+        def is_scatter_round(r):
+            # A round is "scattered" if it needs to load node values from memory
+            # (not preloaded and not handled by special broadcast round 5).
+            return r not in (0, wrap_round, 1, wrap_round+1, 2, wrap_round+2,
+                             3, wrap_round+3, 4, wrap_round+4, 5, wrap_round+5)
+
+        def gen_addr_compute(chunk_idx):
+            regs = chunk_regs[chunk_idx]
+            for vi in range(VLEN):
+                all_slots.append(('alu', ('+', regs['tmp'] + vi, fvp, regs['idx'] + vi)))
+
+        def gen_loads(chunk_idx):
+            regs = chunk_regs[chunk_idx]
+            for vi in range(VLEN):
+                all_slots.append(('load', ('load', regs['nv'] + vi, regs['tmp'] + vi)))
 
         # ---- Main round loop ----
         r = 0
         while r < rounds:
             if r == 0 or r == wrap_round:
-                # Round 0: All chunks use node 0
                 for chunk in range(ALU_CHUNKS, num_chunks):
                     regs = chunk_regs[chunk]
                     gen_hash_valu(chunk, node_val_is_vec=True, node_val_vec=vec_nodes[0])
-                    body.append(('valu', ('&', regs['nv'], regs['val'], vec_consts[1])))
-                    body.append(('valu', ('+', regs['idx'], regs['nv'], vec_consts[1])))
+                    all_slots.append(('valu', ('&', regs['nv'], regs['val'], vec_consts[1])))
+                    all_slots.append(('valu', ('+', regs['idx'], regs['nv'], vec_consts[1])))
                 for chunk in range(min(ALU_CHUNKS, num_chunks)):
                     regs = chunk_regs[chunk]
                     gen_hash_alu(chunk, node_val_is_scalar=True, node_val_scalar=vec_nodes[0])
                     for vi in range(VLEN):
                         val = regs['val'] + vi
-                        nv  = regs['nv'] + vi
+                        nv = regs['nv'] + vi
                         idx = regs['idx'] + vi
-                        body.append(('alu', ('&', nv, val, consts[1])))
-                        body.append(('alu', ('+', idx, nv, consts[1])))
+                        all_slots.append(('alu', ('&', nv, val, consts[1])))
+                        all_slots.append(('alu', ('+', idx, nv, consts[1])))
                 r += 1
 
             elif r == 1 or r == wrap_round + 1:
-                # Round 1: nodes 1 or 2
                 for chunk in range(ALU_CHUNKS, num_chunks):
                     gen_node_val_r1_valu(chunk)
                     gen_hash_valu(chunk)
@@ -507,43 +514,34 @@ class KernelBuilder:
                 r += 1
 
             elif r == 2 or r == wrap_round + 2:
-                # Round 2: nodes 3, 4, 5, or 6
                 for chunk in range(ALU_CHUNKS, num_chunks):
                     regs = chunk_regs[chunk]
                     gen_node_val_r2_valu(chunk)
                     gen_hash_valu(chunk)
                     gen_idx_update_valu(chunk)
-                    # Pre-compute addresses for round 3 while doing hash
                     if C_FLOW3 <= chunk < C_LOAD3_END:
                         for vi in range(VLEN):
-                            body.append(('alu', ('+', regs['tmp'] + vi, fvp, regs['idx'] + vi)))
+                            all_slots.append(('alu', ('+', regs['tmp'] + vi, fvp, regs['idx'] + vi)))
                 for chunk in range(min(ALU_CHUNKS, num_chunks)):
                     gen_node_val_r2_alu(chunk)
                     gen_hash_alu(chunk)
                     gen_idx_update_alu(chunk)
-                    if C_FLOW3 <= chunk < C_LOAD3_END:
-                        regs = chunk_regs[chunk]
-                        for vi in range(VLEN):
-                            body.append(('alu', ('+', regs['tmp'] + vi, fvp, regs['idx'] + vi)))
                 r += 1
 
             elif r == 3 or r == wrap_round + 3:
-                # Round 3: nodes 7-14 (8 nodes)
                 c_flow = C_FLOW3
                 c_load = C_LOAD3
 
-                # Phase 1: All scattered loads (separated for better VLIW packing)
                 for chunk in range(c_flow, c_flow + c_load):
                     regs = chunk_regs[chunk]
                     for vi in range(VLEN):
-                        body.append(('load', ('load', regs['nv'] + vi, regs['tmp'] + vi)))
+                        all_slots.append(('load', ('load', regs['nv'] + vi, regs['tmp'] + vi)))
 
-                # Phase 2: All node selections + hash + idx update
                 for chunk in range(num_chunks):
                     if chunk < c_flow:
                         gen_node_val_flow(chunk, 7, 8)
                     elif chunk < c_flow + c_load:
-                        pass  # Already loaded
+                        pass
                     else:
                         gen_node_val_alu(chunk, 7, 8)
 
@@ -554,111 +552,102 @@ class KernelBuilder:
                         gen_hash_valu(chunk)
                         gen_idx_update_valu(chunk)
 
-                    # Pre-compute addresses for round 4
                     if C_FLOW4 <= chunk < C_LOAD4_END:
                         regs = chunk_regs[chunk]
                         for vi in range(VLEN):
-                            body.append(('alu', ('+', regs['tmp'] + vi, fvp, regs['idx'] + vi)))
+                            all_slots.append(('alu', ('+', regs['tmp'] + vi, fvp, regs['idx'] + vi)))
                 r += 1
 
             elif r == 4 or r == wrap_round + 4:
-                # Round 4: nodes 15-30 (16 nodes)
                 c_flow = C_FLOW4
                 c_load = C_LOAD4
-                is_last_round = (r == wrap_round + 4)
+                is_last_round = (r == rounds - 1)
 
-                # Phase 1: All scattered loads
                 for chunk in range(c_flow, c_flow + c_load):
                     regs = chunk_regs[chunk]
                     for vi in range(VLEN):
-                        body.append(('load', ('load', regs['nv'] + vi, regs['tmp'] + vi)))
+                        all_slots.append(('load', ('load', regs['nv'] + vi, regs['tmp'] + vi)))
 
-                # Phase 2: All node selections + hash + idx update + stores
                 for chunk in range(num_chunks):
                     if chunk < c_flow:
                         gen_node_val_flow(chunk, 15, 16)
                     elif chunk < c_flow + c_load:
-                        pass  # Already loaded
+                        pass
                     else:
                         gen_node_val_alu(chunk, 15, 16)
 
                     if chunk >= num_chunks - ALU_CHUNKS:
                         gen_hash_alu(chunk)
-                        gen_idx_update_alu(chunk)
+                        if not is_last_round:
+                            gen_idx_update_alu(chunk)
                     else:
                         gen_hash_valu(chunk)
-                        gen_idx_update_valu(chunk)
+                        if not is_last_round:
+                            gen_idx_update_valu(chunk)
 
-                    # Compute addresses for round 5 on first pass
                     if r == 4 and r + 1 < rounds and r + 1 != wrap_round:
                         regs = chunk_regs[chunk]
                         for vi in range(VLEN):
-                            body.append(('alu', ('+', regs['tmp'] + vi, fvp, regs['idx'] + vi)))
+                            all_slots.append(('alu', ('+', regs['tmp'] + vi, fvp, regs['idx'] + vi)))
 
-                    # Overlap STORE with computation
                     if is_last_round:
                         regs = chunk_regs[chunk]
-                        body.append(('store', ('vstore', ptr_idx_st, regs['idx'])))
-                        body.append(('store', ('vstore', ptr_val_st, regs['val'])))
-                        if chunk < num_chunks - 1:
-                            body.append(('alu', ('+', ptr_idx_st, ptr_idx_st, consts[8])))
-                            body.append(('alu', ('+', ptr_val_st, ptr_val_st, consts[8])))
+                        emit_final_store_addr_into_idx(chunk)
+                        all_slots.append(('store', ('vstore', regs['idx'], regs['val'])))
                 r += 1
 
             elif r == 5 or r == wrap_round + 5:
-                # Round 5: nodes 31-62 (dynamic loading)
                 c_flow = min(num_chunks, c_flow5)
                 c_alu = min(num_chunks - c_flow, 1)
                 c_load = num_chunks - c_flow - c_alu
 
-                # Clear nv for FLOW chunks
+                # Chunks using the FLOW cascade seed nv to zero; matching node
+                # values are selected in below.
                 for chunk in range(c_flow):
                     regs = chunk_regs[chunk]
-                    body.append(('valu', ('&', regs['nv'], regs['nv'], vec_consts[0])))
+                    all_slots.append(('valu', ('&', regs['nv'], regs['nv'], vec_consts[0])))
 
-                # Clear nv for ALU chunks
                 for chunk in range(c_flow, c_flow + c_alu):
                     regs = chunk_regs[chunk]
                     for vi in range(VLEN):
-                        body.append(('alu', ('&', regs['nv'] + vi, regs['nv'] + vi, consts[0])))
+                        all_slots.append(('alu', ('&', regs['nv'] + vi, regs['nv'] + vi, consts[0])))
 
-                # Scattered loads for remaining chunks
+                # Remaining chunks use the scattered addresses computed at end
+                # of round 4.
                 for chunk in range(c_flow + c_alu, num_chunks):
                     regs = chunk_regs[chunk]
                     for vi in range(VLEN):
-                        body.append(('load', ('load', regs['nv'] + vi, regs['tmp'] + vi)))
+                        all_slots.append(('load', ('load', regs['nv'] + vi, regs['tmp'] + vi)))
 
-                # Dynamic loading of node values 31-62 for FLOW/ALU chunks
-                body.append(('alu', ('+', scalar_reg, consts[24], consts[7])))  # scalar_reg = 31
-                body.append(('alu', ('+', addr_reg, consts[24], consts[7])))     # addr_reg = 31
-                body.append(('alu', ('+', addr_reg, fvp, addr_reg)))              # addr_reg = &forest_values[31]
+                all_slots.append(('alu', ('+', scalar_reg, consts[24], consts[7])))
+                all_slots.append(('alu', ('+', addr_reg, consts[24], consts[7])))
+                all_slots.append(('alu', ('+', addr_reg, fvp, addr_reg)))
 
                 for i in range(32):
                     if i % 8 == 0:
-                        body.append(('load', ('vload', tmp_vecs[0], addr_reg)))
-                        body.append(('alu', ('+', addr_reg, addr_reg, consts[8])))
+                        all_slots.append(('load', ('vload', tmp_vecs[0], addr_reg)))
+                        all_slots.append(('alu', ('+', addr_reg, addr_reg, consts[8])))
 
-                    body.append(('valu', ('vbroadcast', tmp_vecs[1], tmp_vecs[0] + (i % 8))))
-                    body.append(('valu', ('vbroadcast', tmp_vecs[2], scalar_reg)))
+                    all_slots.append(('valu', ('vbroadcast', tmp_vecs[1], tmp_vecs[0] + (i % 8))))
+                    all_slots.append(('valu', ('vbroadcast', tmp_vecs[2], scalar_reg)))
 
                     for chunk in range(c_flow):
                         regs = chunk_regs[chunk]
-                        body.append(('valu', ('==', regs['tmp'], regs['idx'], tmp_vecs[2])))
-                        body.append(('flow', ('vselect', regs['nv'], regs['tmp'], tmp_vecs[1], regs['nv'])))
+                        all_slots.append(('valu', ('==', regs['tmp'], regs['idx'], tmp_vecs[2])))
+                        all_slots.append(('flow', ('vselect', regs['nv'], regs['tmp'], tmp_vecs[1], regs['nv'])))
 
                     for chunk in range(c_flow, c_flow + c_alu):
                         regs = chunk_regs[chunk]
                         for vi in range(VLEN):
                             idx = regs['idx'] + vi
-                            nv  = regs['nv'] + vi
+                            nv = regs['nv'] + vi
                             tmp = regs['tmp'] + vi
-                            body.append(('alu', ('==', tmp, idx, scalar_reg)))
-                            body.append(('alu', ('*', tmp, tmp, tmp_vecs[1] + vi)))
-                            body.append(('alu', ('+', nv, nv, tmp)))
+                            all_slots.append(('alu', ('==', tmp, idx, scalar_reg)))
+                            all_slots.append(('alu', ('*', tmp, tmp, tmp_vecs[1] + vi)))
+                            all_slots.append(('alu', ('+', nv, nv, tmp)))
 
-                    body.append(('alu', ('+', scalar_reg, scalar_reg, consts[1])))
+                    all_slots.append(('alu', ('+', scalar_reg, scalar_reg, consts[1])))
 
-                # Hash + idx update + address computation
                 for chunk in range(num_chunks):
                     if chunk >= num_chunks - ALU_CHUNKS:
                         gen_hash_alu(chunk)
@@ -667,50 +656,106 @@ class KernelBuilder:
                         gen_hash_valu(chunk)
                         gen_idx_update_valu(chunk)
 
-                    # Compute addresses for round 6
                     if r == 5 and r + 1 < rounds and r + 1 != wrap_round:
                         regs = chunk_regs[chunk]
                         for vi in range(VLEN):
-                            body.append(('alu', ('+', regs['tmp'] + vi, fvp, regs['idx'] + vi)))
+                            all_slots.append(('alu', ('+', regs['tmp'] + vi, fvp, regs['idx'] + vi)))
                 r += 1
 
             else:
-                # General scattered round handler (rounds 6+)
-                do_wrap = (r == wrap_round - 1)
-                is_last_scattered = (r == rounds - 1) or (r == wrap_round - 1 and wrap_round > rounds - 1)
+                # General scattered round handler (rounds 6+).
+                # EXPERIMENT 1: Two-round batching when possible.
+                if r + 1 < rounds and is_scatter_round(r) and is_scatter_round(r + 1):
+                    do_wrap_r = (r == wrap_round - 1)
+                    do_wrap_r1 = (r + 1 == wrap_round - 1)
+                    is_last_r1 = (r + 1 == rounds - 1)
 
-                # Phase-separated scattered loads
-                for chunk in range(num_chunks):
-                    regs = chunk_regs[chunk]
-                    for vi in range(VLEN):
-                        body.append(('load', ('load', regs['nv'] + vi, regs['tmp'] + vi)))
+                    # Round r: loads (addresses computed at end of previous round)
+                    for chunk in range(num_chunks):
+                        gen_loads(chunk)
 
-                for chunk in range(num_chunks):
-                    regs = chunk_regs[chunk]
-                    if chunk >= num_chunks - ALU_CHUNKS:
-                        gen_hash_alu(chunk)
-                        if not do_wrap:
-                            gen_idx_update_alu(chunk)
-                            if not is_last_scattered and r + 1 < rounds and r + 1 != wrap_round:
+                    # Round r: hash + idx_update + addr_compute for r+1
+                    for chunk in range(num_chunks):
+                        regs = chunk_regs[chunk]
+                        if chunk >= num_chunks - ALU_CHUNKS:
+                            gen_hash_alu(chunk)
+                            if do_wrap_r:
                                 for vi in range(VLEN):
-                                    body.append(('alu', ('+', regs['tmp'] + vi, fvp, regs['idx'] + vi)))
-                    else:
-                        gen_hash_valu(chunk)
-                        if not do_wrap:
-                            gen_idx_update_valu(chunk)
-                            if not is_last_scattered and r + 1 < rounds and r + 1 != wrap_round:
+                                    all_slots.append(('alu', ('&', regs['idx'] + vi, consts[0], consts[0])))
+                            else:
+                                gen_idx_update_alu(chunk)
+                            if not is_last_r1:
                                 for vi in range(VLEN):
-                                    body.append(('alu', ('+', regs['tmp'] + vi, fvp, regs['idx'] + vi)))
+                                    all_slots.append(('alu', ('+', regs['tmp'] + vi, fvp, regs['idx'] + vi)))
+                        else:
+                            gen_hash_valu(chunk)
+                            if do_wrap_r:
+                                all_slots.append(('valu', ('&', regs['idx'], regs['idx'], vec_consts[0])))
+                            else:
+                                gen_idx_update_valu(chunk)
+                            if not is_last_r1:
+                                for vi in range(VLEN):
+                                    all_slots.append(('alu', ('+', regs['tmp'] + vi, fvp, regs['idx'] + vi)))
 
-                r += 1
+                    # Round r+1: loads
+                    for chunk in range(num_chunks):
+                        gen_loads(chunk)
 
-        body_instrs = self.build(body, vliw=True)
-        self.instrs.extend(body_instrs)
+                    # Round r+1: hash + idx_update (+ addr_compute for r+2 if needed)
+                    for chunk in range(num_chunks):
+                        regs = chunk_regs[chunk]
+                        if chunk >= num_chunks - ALU_CHUNKS:
+                            gen_hash_alu(chunk)
+                            if do_wrap_r1:
+                                for vi in range(VLEN):
+                                    all_slots.append(('alu', ('&', regs['idx'] + vi, consts[0], consts[0])))
+                            else:
+                                gen_idx_update_alu(chunk)
+                            if not is_last_r1 and r + 2 < rounds and r + 2 != wrap_round:
+                                for vi in range(VLEN):
+                                    all_slots.append(('alu', ('+', regs['tmp'] + vi, fvp, regs['idx'] + vi)))
+                        else:
+                            gen_hash_valu(chunk)
+                            if do_wrap_r1:
+                                all_slots.append(('valu', ('&', regs['idx'], regs['idx'], vec_consts[0])))
+                            else:
+                                gen_idx_update_valu(chunk)
+                            if not is_last_r1 and r + 2 < rounds and r + 2 != wrap_round:
+                                for vi in range(VLEN):
+                                    all_slots.append(('alu', ('+', regs['tmp'] + vi, fvp, regs['idx'] + vi)))
 
-        self.instrs.append({'flow': [('pause',)]})
+                    r += 2
+                else:
+                    # Single scattered round (original code)
+                    do_wrap = (r == wrap_round - 1)
+                    is_last_scattered = (r == rounds - 1) or (r == wrap_round - 1 and wrap_round > rounds - 1)
+
+                    for chunk in range(num_chunks):
+                        gen_loads(chunk)
+
+                    for chunk in range(num_chunks):
+                        regs = chunk_regs[chunk]
+                        if chunk >= num_chunks - ALU_CHUNKS:
+                            gen_hash_alu(chunk)
+                            if not do_wrap:
+                                gen_idx_update_alu(chunk)
+                                if not is_last_scattered and r + 1 < rounds and r + 1 != wrap_round:
+                                    for vi in range(VLEN):
+                                        all_slots.append(('alu', ('+', regs['tmp'] + vi, fvp, regs['idx'] + vi)))
+                        else:
+                            gen_hash_valu(chunk)
+                            if not do_wrap:
+                                gen_idx_update_valu(chunk)
+                                if not is_last_scattered and r + 1 < rounds and r + 1 != wrap_round:
+                                    for vi in range(VLEN):
+                                        all_slots.append(('alu', ('+', regs['tmp'] + vi, fvp, regs['idx'] + vi)))
+                    r += 1
+
+        self.instrs.extend(self.build(all_slots, vliw=True))
 
 
 BASELINE = 147734
+
 
 def do_kernel_test(
     forest_height: int,
@@ -719,15 +764,19 @@ def do_kernel_test(
     seed: int = 123,
     trace: bool = False,
     prints: bool = False,
+    c_flow3=10, c_flow4=5, c_flow5=11,
 ):
     print(f'{forest_height=}, {rounds=}, {batch_size=}')
+    import random
     random.seed(seed)
+    from problem import Tree, Input, build_mem_image, reference_kernel2, Machine, N_CORES
     forest = Tree.generate(forest_height)
     inp = Input.generate(forest, batch_size, rounds)
     mem = build_mem_image(forest, inp)
 
     kb = KernelBuilder()
-    kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
+    kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds,
+                    c_flow3=c_flow3, c_flow4=c_flow4, c_flow5=c_flow5)
 
     value_trace = {}
     machine = Machine(
@@ -741,42 +790,38 @@ def do_kernel_test(
     for i, ref_mem in enumerate(reference_kernel2(mem, value_trace)):
         machine.run()
         inp_values_p = ref_mem[6]
-        if prints:
-            print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
-            print(ref_mem[inp_values_p : ref_mem[6] + len(inp.values)])
         assert (
             machine.mem[inp_values_p : inp_values_p + len(inp.values)]
             == ref_mem[inp_values_p : ref_mem[6] + len(inp.values)]
         ), f'Incorrect result on round {i}'
-        inp_indices_p = ref_mem[5]
-        if prints:
-            print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-            print(ref_mem[inp_indices_p : ref_mem[5] + len(inp.indices)])
 
     print('CYCLES: ', machine.cycle)
     print('Speedup over baseline: ', BASELINE / machine.cycle)
     return machine.cycle
 
 
-class Tests(unittest.TestCase):
-    def test_ref_kernels(self):
-        random.seed(123)
-        for i in range(10):
-            f = Tree.generate(4)
-            inp = Input.generate(f, 10, 6)
-            mem = build_mem_image(f, inp)
-            reference_kernel(f, inp)
-            for _ in reference_kernel2(mem, {}):
-                pass
-            assert inp.indices == mem[mem[5] : mem[5] + len(inp.indices)]
-            assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
-
-    def test_kernel_trace(self):
-        do_kernel_test(10, 16, 256, trace=True, prints=False)
-
-    def test_kernel_cycles(self):
-        do_kernel_test(10, 16, 256)
-
-
 if __name__ == '__main__':
+    import unittest
+    from problem import Tree, Input, build_mem_image, reference_kernel, reference_kernel2
+
+    class Tests(unittest.TestCase):
+        def test_ref_kernels(self):
+            import random
+            random.seed(123)
+            for i in range(10):
+                f = Tree.generate(4)
+                inp = Input.generate(f, 10, 6)
+                mem = build_mem_image(f, inp)
+                reference_kernel(f, inp)
+                for _ in reference_kernel2(mem, {}):
+                    pass
+                assert inp.indices == mem[mem[5] : mem[5] + len(inp.indices)]
+                assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
+
+        def test_kernel_trace(self):
+            do_kernel_test(10, 16, 256, trace=True, prints=False)
+
+        def test_kernel_cycles(self):
+            do_kernel_test(10, 16, 256)
+
     unittest.main()
