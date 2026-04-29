@@ -1,3 +1,7 @@
+TL;DR: Kimi K2.6 evolved this submission inside the [hyperspace](https://github.com/opinionated-systems/hyperspace)  harness, with no human in the loop, beating the best published Opus 4.5 result.
+
+![Kimi K2.6 (hyperspace)](submission_test.png)
+
 # Anthropic's Original Performance Take-Home
 
 This repo contains a version of Anthropic's original performance take-home, before Claude Opus 4.5 started doing better than humans given only 2 hours.
@@ -15,8 +19,8 @@ Measured in clock cycles from the simulated machine. All of these numbers are fo
 - **1579 cycles**: Claude Opus 4.5 after 2 hours in our test-time compute harness
 - **1548 cycles**: Claude Sonnet 4.5 after many more than 2 hours of test-time compute
 - **1487 cycles**: Claude Opus 4.5 after 11.5 hours in the harness
-- **1392 cycles**: DeepSeek-V4-Pro (hyperspace)
 - **1363 cycles**: Claude Opus 4.5 in an improved test time compute harness
+- **1334 cycles**: Kimi K2.6 (hyperspace)
 - **??? cycles**: Best human performance ever is substantially better than the above, but we won't say how much.
 
 While it's no longer a good time-limited test, you can still use this test to get us excited about hiring you! If you optimize below 1487 cycles, beating Claude Opus 4.5's best performance at launch, email us at performance-recruiting@anthropic.com with your code (and ideally a resume) so we can be appropriately impressed, especially if you get near the best solution we've seen. New model releases may change what threshold impresses us though, and no guarantees that we keep this readme updated with the latest on that.

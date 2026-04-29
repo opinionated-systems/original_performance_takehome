@@ -1,4 +1,22 @@
-# DeepSeek-V4-Pro
+# kimi-k2p6
+
+"""
+# Anthropic's Original Performance Engineering Take-home (Release version)
+
+Copyright Anthropic PBC 2026. Permission is granted to modify, but not
+to publish or redistribute your solutions so it's hard to find spoilers.
+
+# Task
+
+- Optimize the kernel (in KernelBuilder.build_kernel) as much as possible in the
+available time, as measured by test_kernel_cycles on a frozen separate copy
+of the simulator.
+
+Validate your results using `python tests/submission_tests.py` without modifying
+anything in the tests/ folder.
+
+We recommend you look through problem.py next.
+"""
 
 from collections import defaultdict
 import random
@@ -179,6 +197,9 @@ class KernelBuilder:
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
 
+    def add_vliw(self, slots):
+        self.instrs.extend(self.build(slots, vliw=True))
+
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
         if name is not None:
@@ -246,7 +267,7 @@ class KernelBuilder:
             if val not in (4097, 33):
                 vec_hash[val] = self.alloc_scratch(f'vh_{val & 0xFFFF}', VLEN)
 
-        PRELOADED_NODES = 15
+        PRELOADED_NODES = 24
         vec_nodes = {}
         for i in range(PRELOADED_NODES):
             vec_nodes[i] = self.alloc_scratch(f'vn_{i}', VLEN)
@@ -269,9 +290,10 @@ class KernelBuilder:
             else:
                 all_slots.append(('valu', ('vbroadcast', vec_hash[val], hash_consts[val])))
 
-        for i in range(2):
+        # Preload nodes 0-23 (3 vectors of 8)
+        for i in range(3):
             addr_reg = chunk_regs[i % 4]['tmp']
-            all_slots.append(('alu', ('+', addr_reg, consts[7], consts[i * 8])))
+            all_slots.append(('flow', ('add_imm', addr_reg, consts[7], i * 8)))
             all_slots.append(('load', ('vload', tmp_vec, addr_reg)))
             for j in range(8):
                 node_idx = i * 8 + j
@@ -279,13 +301,12 @@ class KernelBuilder:
                     all_slots.append(('valu', ('vbroadcast', vec_nodes[node_idx], tmp_vec + j)))
 
         ptr = self.alloc_scratch('ptr')
-        all_slots.append(('alu', ('+', ptr, inp_values_p, consts[0])))
+        all_slots.append(('flow', ('add_imm', ptr, inp_values_p, 0)))
 
-        # add_imm for input pointer
         for chunk in range(num_chunks):
             all_slots.append(('load', ('vload', chunk_regs[chunk]['val'], ptr)))
             if chunk < num_chunks - 1:
-                all_slots.append(('flow', ('add_imm', ptr, ptr, VLEN)))
+                all_slots.append(('flow', ('add_imm', ptr, ptr, 8)))
 
         wrap_round = forest_height + 1
 
@@ -403,10 +424,11 @@ class KernelBuilder:
 
         def gen_node_val_r3_valu(chunk_idx):
             regs = chunk_regs[chunk_idx]
-            all_slots.append(('valu', ('&', regs['nv'], regs['nv'], vec_consts[0])))
-            for node in range(7, 15):
+            all_slots.append(('valu', ('==', regs['tmp'], regs['idx'], vec_consts[7])))
+            all_slots.append(('flow', ('vselect', regs['nv'], regs['tmp'], vec_nodes[7], vec_consts[0])))
+            for node in range(8, 15):
                 all_slots.append(('valu', ('==', regs['tmp'], regs['idx'], vec_consts[node])))
-                all_slots.append(('valu', ('multiply_add', regs['nv'], regs['tmp'], vec_nodes[node], regs['nv'])))
+                all_slots.append(('flow', ('vselect', regs['nv'], regs['tmp'], vec_nodes[node], regs['nv'])))
 
         def gen_node_val_r3_alu(chunk_idx):
             regs = chunk_regs[chunk_idx]
@@ -414,8 +436,9 @@ class KernelBuilder:
                 idx = regs['idx'] + vi
                 nv = regs['nv'] + vi
                 tmp = regs['tmp'] + vi
-                all_slots.append(('alu', ('&', nv, nv, consts[0])))
-                for node in range(7, 15):
+                all_slots.append(('alu', ('==', tmp, idx, consts[7])))
+                all_slots.append(('alu', ('*', nv, tmp, vec_nodes[7] + vi)))
+                for node in range(8, 15):
                     all_slots.append(('alu', ('==', tmp, idx, consts[node])))
                     all_slots.append(('alu', ('*', tmp, tmp, vec_nodes[node] + vi)))
                     all_slots.append(('alu', ('+', nv, nv, tmp)))
@@ -452,13 +475,12 @@ class KernelBuilder:
                         nv = chunk_regs[chunk_idx]['nv'] + vi
                         idx = chunk_regs[chunk_idx]['idx'] + vi
                         all_slots.append(('alu', ('&', nv, val, consts[1])))
-                        all_slots.append(('alu', ('+', idx, nv, consts[1])))
+                        all_slots.append(('flow', ('add_imm', idx, nv, 1)))
                 else:
                     regs = chunk_regs[chunk_idx]
-                    all_slots.append(('valu', ('multiply_add', regs['idx'], regs['idx'], vec_consts[2], vec_consts[1])))
                     gen_hash_valu(chunk_idx, node_val_is_vec=True, node_val_vec=vec_nodes[0])
                     all_slots.append(('valu', ('&', regs['nv'], regs['val'], vec_consts[1])))
-                    all_slots.append(('valu', ('+', regs['idx'], regs['idx'], regs['nv'])))
+                    all_slots.append(('valu', ('+', regs['idx'], vec_consts[1], regs['nv'])))
 
             elif r == 1 or r == wrap_round + 1:
                 if is_alu(chunk_idx):
@@ -494,51 +516,20 @@ class KernelBuilder:
                 do_wrap = (r == wrap_round - 1)
                 process_scattered_round(chunk_idx, do_wrap)
 
-        GROUP_SIZE = 6
-        for chunk_group in range(0, num_chunks, GROUP_SIZE):
-            chunks_in_group = []
-            for i in range(GROUP_SIZE):
-                c = chunk_group + i
-                if c < num_chunks:
-                    chunks_in_group.append(c)
-            
-            r = 0
-            while r < rounds:
-                if r == 0 or r == wrap_round:
-                    for c in chunks_in_group:
-                        process_round(c, r)
-                    r += 1
-                elif r == 1 or r == wrap_round + 1:
-                    for c in chunks_in_group:
-                        process_round(c, r)
-                    r += 1
-                elif r == 2 or r == wrap_round + 2:
-                    for c in chunks_in_group:
-                        process_round(c, r)
-                    r += 1
-                elif r == 3 or r == wrap_round + 3:
-                    for c in chunks_in_group:
-                        process_round(c, r)
-                    r += 1
-                elif r + 1 < rounds and is_scatter(r) and is_scatter(r + 1):
-                    for c in chunks_in_group:
-                        for rd in range(2):
-                            do_wrap = (r + rd == wrap_round - 1)
-                            process_scattered_round(c, do_wrap)
-                    r += 2
-                else:
-                    for c in chunks_in_group:
-                        do_wrap = (r == wrap_round - 1)
-                        process_scattered_round(c, do_wrap)
-                    r += 1
+        # Chunk-pair major: process 2 chunks together, all rounds
+        PAIR_SIZE = 2
+        for chunk_pair in range(0, num_chunks, PAIR_SIZE):
+            for r in range(rounds):
+                for c in range(chunk_pair, min(chunk_pair + PAIR_SIZE, num_chunks)):
+                    process_round(c, r)
 
-        # ALU + for store pointer
-        all_slots.append(('alu', ('+', ptr, inp_values_p, consts[0])))
+        # Store results
+        all_slots.append(('flow', ('add_imm', ptr, inp_values_p, 0)))
         for chunk in range(num_chunks):
             regs = chunk_regs[chunk]
             all_slots.append(('store', ('vstore', ptr, regs['val'])))
             if chunk < num_chunks - 1:
-                all_slots.append(('alu', ('+', ptr, ptr, consts[8])))
+                all_slots.append(('flow', ('add_imm', ptr, ptr, 8)))
 
         self.instrs.extend(self.build(all_slots, vliw=True))
 
